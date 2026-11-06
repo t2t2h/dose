@@ -1,0 +1,141 @@
+
+name: AflatoonMubdi - Unified Build
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      build_mode:
+        description: Build mode
+        required: true
+        type: choice
+        default: embedded-safe
+        options:
+          - embedded-safe
+          - jailbreak-runtime
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build iOS dylib
+    runs-on: macos-14
+
+    env:
+      THEOS: ${{ github.workspace }}/.theos
+      AP_BUILD_MODE: ${{ github.event.inputs.build_mode || 'embedded-safe' }}
+
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          brew install make ldid
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Install Theos
+        run: |
+          git clone --depth 1 --recursive \
+            https://github.com/theos/theos.git "$THEOS"
+
+          git clone --depth 1 \
+            https://github.com/theos/sdks.git "$THEOS/sdks"
+
+          test -d "$THEOS/makefiles"
+
+          SDK=$(find "$THEOS/sdks" \
+            -maxdepth 1 -type d \
+            -name 'iPhoneOS*.sdk' | head -n 1)
+
+          if [ -z "$SDK" ]; then
+            echo "ERROR: iOS SDK not found"
+            exit 1
+          fi
+
+          echo "Using SDK: $SDK"
+
+      - name: Verify project files
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          mk = Path("Makefile").read_text()
+          match = re.search(
+              r"^AflatoonMubdi_FILES\s*=\s*(.+)$",
+              mk, re.M
+          )
+
+          if not match:
+              raise SystemExit("AflatoonMubdi_FILES missing")
+
+          sources = match.group(1).split()
+
+          headers = [
+              "Shared.h",
+              "DNS.h",
+              "DSP.h",
+              "Time.h",
+              "Rebind.h",
+              "SpeedCore.h",
+              "AgoraStubs.h"
+          ]
+
+          missing = [
+              f for f in sources + headers
+              if not Path(f).is_file()
+          ]
+
+          if missing:
+              raise SystemExit(
+                  "Missing files: " + ", ".join(missing)
+              )
+
+          print("All source files and headers verified.")
+          print("Sources:", len(sources))
+          PY
+
+      - name: Compile AflatoonMubdi
+        run: |
+          set -e
+
+          make clean || true
+
+          make FINALPACKAGE=1 \
+            AP_BUILD_MODE="$AP_BUILD_MODE"
+
+      - name: Verify compiled library
+        run: |
+          set -e
+
+          mkdir -p out
+
+          find .theos -type f \
+            -name "AflatoonMubdi.dylib" \
+            -exec cp {} out/ \;
+
+          test -s out/AflatoonMubdi.dylib
+
+          file out/AflatoonMubdi.dylib
+
+          otool -L out/AflatoonMubdi.dylib
+
+          shasum -a 256 \
+            out/AflatoonMubdi.dylib \
+            > out/SHA256.txt
+
+          echo "$AP_BUILD_MODE" \
+            > out/BUILD-MODE.txt
+
+      - name: Upload final build
+        uses: actions/upload-artifact@v4
+        with:
+          name: AflatoonMubdi-${{ github.run_number }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 30

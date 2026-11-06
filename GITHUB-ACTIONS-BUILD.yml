@@ -1,0 +1,90 @@
+name: Build AflatoonMubdi
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      build_mode:
+        description: Build profile
+        required: true
+        default: embedded-safe
+        type: choice
+        options:
+          - embedded-safe
+          - jailbreak-runtime
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build unified iOS dylib
+    runs-on: macos-14
+    env:
+      THEOS: ${{ github.workspace }}/.theos-toolchain
+      AP_BUILD_MODE: ${{ github.event.inputs.build_mode || 'embedded-safe' }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          brew install make ldid
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Install Theos and iOS SDKs
+        run: |
+          git clone --depth 1 --recursive https://github.com/theos/theos.git "$THEOS"
+          mkdir -p "$THEOS/sdks"
+          if [ ! -d "$THEOS/sdks/iPhoneOS.sdk" ]; then
+            git clone --depth 1 https://github.com/theos/sdks.git "$THEOS/sdks-repo"
+            cp -R "$THEOS/sdks-repo/"* "$THEOS/sdks/"
+          fi
+          test -d "$THEOS/makefiles"
+          test -d "$THEOS/sdks"
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+
+      - name: Verify all build sources and headers
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re, sys
+          mk = Path('Makefile').read_text()
+          match = re.search(r'^AflatoonMubdi_FILES\s*=\s*(.+)$', mk, re.M)
+          if not match:
+              raise SystemExit('AflatoonMubdi_FILES missing from Makefile')
+          sources = match.group(1).split()
+          required = ['Main.m', 'Hook.m', 'UI.m', 'Shared.h', 'DNS.h', 'DSP.h', 'Time.h', 'Rebind.h', 'SpeedCore.h', 'AgoraStubs.h']
+          missing = [f for f in sources + required if not Path(f).is_file()]
+          if missing:
+              raise SystemExit('Missing project files: ' + ', '.join(sorted(set(missing))))
+          if any('WireGuard' in p.name or 'PacketTunnel' in p.name for p in Path('.').rglob('*')):
+              raise SystemExit('Unexpected VPN source remains in project')
+          print(f'Validated {len(sources)} compilation sources and required headers.')
+          PY
+
+      - name: Build dylib
+        run: |
+          set -o pipefail
+          make clean || true
+          make FINALPACKAGE=1 AP_BUILD_MODE="$AP_BUILD_MODE"
+
+      - name: Collect and inspect output
+        run: |
+          mkdir -p out
+          find .theos -type f -name 'AflatoonMubdi.dylib' -exec cp {} out/ \;
+          test -s out/AflatoonMubdi.dylib
+          file out/AflatoonMubdi.dylib
+          otool -L out/AflatoonMubdi.dylib
+          printf '%s\n' "$AP_BUILD_MODE" > out/BUILD-MODE.txt
+          shasum -a 256 out/AflatoonMubdi.dylib > out/SHA256.txt
+
+      - name: Upload compiled dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: AflatoonMubdi-${{ env.AP_BUILD_MODE }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 30
